@@ -28,7 +28,7 @@ pub(crate) struct Pending {
     shaders: Vec<Arc<Shader>>,
     pub(crate) graphics: Option<Box<GraphicsState>>,
     queued: AtomicBool,
-    made: OnceLock<Option<HostPipeline>>,
+    made: OnceLock<Result<HostPipeline, String>>,
     /// What identifies it across runs (shader containers and state), and
     /// whether a draw has used it yet.
     key: String,
@@ -69,13 +69,13 @@ impl Pending {
 }
 
 /// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// not translate, the worker's refusal, or "being made".
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
-        Some(Some(_)) => None,
+        Some(Ok(_)) => None,
         None => Some("being made".into()),
-        Some(None) => {
+        Some(Err(reason)) => {
             let failed: Vec<String> = p
                 .shaders
                 .iter()
@@ -83,7 +83,7 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
                 .map(|s| format!("{} {}", s.stage, s.hash))
                 .collect();
             Some(if failed.is_empty() {
-                format!("refused {:?}", p.shaders)
+                format!("refused {:?}: {reason}", p.shaders)
             } else {
                 failed.join(" + ")
             })
@@ -112,7 +112,7 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
         start(p);
         wait(p, crate::frame::current());
     }
-    let made = p.made.get()?.as_ref();
+    let made = p.made.get()?.as_ref().ok();
     if made.is_some() && !p.used.swap(true, Ordering::Relaxed) {
         super::library::note_used(&p.key);
     }
@@ -227,12 +227,19 @@ mod tests {
     #[test]
     fn first_use_is_made_by_a_worker() {
         let p = Arc::new(Pending::new(Vec::new(), None));
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(missing(&p).as_deref(), Some("being made"));
         assert!(ready(&p).is_none());
         assert!(p.queued.load(Ordering::Relaxed));
         let started = Instant::now();
         while p.made.get().is_none() && started.elapsed() < Duration::from_secs(10) {
             std::thread::yield_now();
         }
-        assert!(matches!(p.made.get(), Some(None)));
+        assert!(matches!(p.made.get(), Some(Err(_))));
+        #[cfg(feature = "diagnostics")]
+        assert_eq!(
+            missing(&p).as_deref(),
+            Some("refused []: no vertex or mesh shader")
+        );
     }
 }

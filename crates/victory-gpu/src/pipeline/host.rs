@@ -278,20 +278,37 @@ pub(crate) struct HostPipeline {
 }
 
 /// Logs a pipeline that gets no host pipeline, once per reason.
-fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline> {
+fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Result<HostPipeline, String> {
     static SEEN: std::sync::Mutex<Vec<&str>> = std::sync::Mutex::new(Vec::new());
     let mut seen = SEEN.lock().unwrap_or_else(|e| e.into_inner());
     if !seen.contains(&reason) {
         seen.push(reason);
         tracing::warn!(?shaders, "no host pipeline: {reason} (logged once)");
     }
-    None
+    Err(reason.to_owned())
+}
+
+fn driver_refusal(operation: &str, error: &windows::core::Error) -> String {
+    format!("{operation} (0x{:08X})", error.code().0 as u32)
+}
+
+#[cfg(test)]
+#[test]
+fn driver_refusal_keeps_the_operation_and_hresult() {
+    let error = windows::core::Error::from_hresult(windows::Win32::Foundation::E_INVALIDARG);
+    assert_eq!(
+        driver_refusal("host compute pipeline", &error),
+        "host compute pipeline (0x80070057)"
+    );
 }
 
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
-    pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+    pub(crate) fn new(
+        shaders: &[Arc<Shader>],
+        g: Option<&GraphicsState>,
+    ) -> Result<HostPipeline, String> {
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),
@@ -320,20 +337,20 @@ impl HostPipeline {
             stages.extend(find("pixel").map(|ps| (ps, D3D12_SHADER_VISIBILITY_PIXEL)));
             stages
         };
-        if mesh.is_some() && !host()?.mesh_shaders() {
+        if mesh.is_some() && !host().ok_or("no host D3D12 device")?.mesh_shaders() {
             return refuse("the host GPU has no mesh shaders (or no shader model 6.6)", shaders);
         }
         for (s, _) in &stages {
-            s.translated()?;
+            s.translated().ok_or("shader translation failed")?;
         }
-        let host = host()?;
+        let host = host().ok_or("no host D3D12 device")?;
 
         // The root signature the translated shaders' bindings define.
         let mut params: Vec<D3D12_ROOT_PARAMETER1> = Vec::new();
         let mut samplers = Vec::new();
         let mut bound = Vec::new();
         for &(shader, visibility) in &stages {
-            let t = &shader.translated()?.host;
+            let t = &shader.translated().ok_or("shader translation failed")?.host;
             let mut stage = Stage {
                 shader: shader.clone(),
                 user_data: None,
@@ -405,7 +422,7 @@ impl HostPipeline {
             Ok(root) => root,
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host root signature refused");
-                return None;
+                return Err(driver_refusal("host root signature", &e));
             }
         };
         let code = |i: usize| {
@@ -437,12 +454,12 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                     host.log_messages();
-                    return None;
+                    return Err(driver_refusal("host compute pipeline", &e));
                 }
             };
             tracing::info!(?shaders, "host pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
-            return Some(HostPipeline {
+            return Ok(HostPipeline {
                 compute: true,
                 mesh: false,
                 pso,
@@ -469,12 +486,12 @@ impl HostPipeline {
                 Err(e) => {
                     tracing::warn!(error = %e, ?shaders, "host mesh pipeline refused");
                     host.log_messages();
-                    return None;
+                    return Err(driver_refusal("host mesh pipeline", &e));
                 }
             };
             tracing::info!(?shaders, "host mesh pipeline");
             crate::host::name(&pso, || format!("{shaders:?}"));
-            return Some(HostPipeline {
+            return Ok(HostPipeline {
                 compute: false,
                 mesh: true,
                 pso,
@@ -530,7 +547,7 @@ impl HostPipeline {
             Err(e) => {
                 tracing::warn!(error = %e, ?shaders, "host pipeline refused");
                 host.log_messages();
-                return None;
+                return Err(driver_refusal("host graphics pipeline", &e));
             }
         };
         tracing::info!(?shaders, "host pipeline");
@@ -544,7 +561,7 @@ impl HostPipeline {
             cull = g.rasterizer.CullMode.0,
             "host graphics state"
         );
-        Some(HostPipeline {
+        Ok(HostPipeline {
             compute: false,
             mesh: false,
             pso,
